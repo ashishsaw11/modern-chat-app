@@ -8,11 +8,13 @@ const rateLimit = require('express-rate-limit');
 const path = require('path');
 const http = require('http');
 const socketIo = require('socket.io');
+const fs = require('fs');
 
 const app = express();
 const server = http.createServer(app);
 
-const PORT = process.env.PORT || 5000;
+// FIXED: Change default port to 10000 for Render
+const PORT = process.env.PORT || 10000;
 const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key-change-in-production';
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
@@ -28,7 +30,7 @@ const corsOptions = {
         }
         callback(new Error('Not allowed by CORS'));
       }
-    : ['http://localhost:3000', 'http://localhost:5000'],
+    : ['http://localhost:3000', 'http://localhost:5000', 'http://localhost:10000'],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
@@ -44,7 +46,7 @@ const io = socketIo(server, {
           }
           callback(new Error('Not allowed by CORS'));
         }
-      : "http://localhost:3000",
+      : ["http://localhost:3000", "http://localhost:10000"],
     methods: ["GET", "POST"],
     credentials: true
   }
@@ -71,17 +73,26 @@ app.get('/api/health', (req, res) => {
     status: 'OK', 
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    environment: NODE_ENV
+    environment: NODE_ENV,
+    port: PORT
   });
 });
 
+// Root health check
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'OK' });
+});
+
 // Initialize SQLite Database
-const dbPath = NODE_ENV === 'production' ? './chat.db' : './chat.db';
+// FIXED: Better database path handling for Render
+const dbPath = path.join(__dirname, 'chat.db');
+console.log('Database path:', dbPath);
+
 const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
     console.error('Error opening database:', err);
   } else {
-    console.log('Connected to SQLite database');
+    console.log('Connected to SQLite database at:', dbPath);
     initializeDatabase();
   }
 });
@@ -169,6 +180,7 @@ app.get('/api/captcha', (req, res) => {
     
     res.json({ captcha, sessionId });
   } catch (error) {
+    console.error('CAPTCHA generation error:', error);
     res.status(500).json({ error: 'Failed to generate CAPTCHA' });
   }
 });
@@ -411,21 +423,121 @@ io.on('connection', (socket) => {
   });
 });
 
-// Serve static files in production
+// Handle favicon.ico specifically to prevent 500 errors
+app.get('/favicon.ico', (req, res) => {
+  res.status(204).end(); // No content, but successful response
+});
+
+// Handle robots.txt
+app.get('/robots.txt', (req, res) => {
+  res.type('text/plain');
+  res.send('User-agent: *\nDisallow: /api/\nAllow: /');
+});
+
+// FIXED: Better static file serving for production
 if (NODE_ENV === 'production') {
-  // Serve static files from React build
-  app.use(express.static(path.join(__dirname, 'client/build')));
+  const clientBuildPath = path.join(__dirname, 'client', 'build');
   
-  // Handle React routing, return all requests to React app
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'client/build', 'index.html'));
-  });
+  // Check if client build directory exists
+  if (fs.existsSync(clientBuildPath)) {
+    console.log('Serving static files from:', clientBuildPath);
+    app.use(express.static(clientBuildPath, {
+      maxAge: '1d', // Cache static files for 1 day
+      setHeaders: (res, path) => {
+        if (path.endsWith('.html')) {
+          res.setHeader('Cache-Control', 'no-cache');
+        }
+      }
+    }));
+    
+    // Handle React routing, return all requests to React app
+    app.get('*', (req, res) => {
+      try {
+        res.sendFile(path.join(clientBuildPath, 'index.html'));
+      } catch (error) {
+        console.error('Error serving index.html:', error);
+        res.status(500).json({ error: 'Failed to serve application' });
+      }
+    });
+  } else {
+    console.log('Client build directory not found, serving API only');
+    
+    // Create a simple HTML page for the root route
+    app.get('/', (req, res) => {
+      res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <title>Chat API Server</title>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 40px; }
+            .container { max-width: 600px; margin: 0 auto; }
+            .endpoint { background: #f5f5f5; padding: 10px; margin: 5px 0; border-radius: 5px; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <h1>🚀 Chat API Server</h1>
+            <p>The server is running successfully!</p>
+            
+            <h2>Available API Endpoints:</h2>
+            <div class="endpoint">GET /api/health - Server health check</div>
+            <div class="endpoint">GET /api/captcha - Generate CAPTCHA</div>
+            <div class="endpoint">POST /api/register - Register new user</div>
+            <div class="endpoint">POST /api/login - User login</div>
+            <div class="endpoint">GET /api/users/search - Search users (requires auth)</div>
+            <div class="endpoint">GET /api/messages/:userId - Get messages (requires auth)</div>
+            <div class="endpoint">POST /api/messages - Send message (requires auth)</div>
+            <div class="endpoint">POST /api/logout - User logout (requires auth)</div>
+            
+            <h2>Server Info:</h2>
+            <p><strong>Environment:</strong> ${NODE_ENV}</p>
+            <p><strong>Port:</strong> ${PORT}</p>
+            <p><strong>Time:</strong> ${new Date().toISOString()}</p>
+          </div>
+        </body>
+        </html>
+      `);
+    });
+    
+    // Handle other non-API routes
+    app.get('*', (req, res) => {
+      // Don't handle API routes here
+      if (req.path.startsWith('/api/')) {
+        return;
+      }
+      
+      res.status(404).json({ 
+        error: 'Page not found',
+        message: 'This is an API-only server. Check the root path for available endpoints.',
+        availableEndpoints: ['/api/health', '/api/captcha', '/api/register', '/api/login']
+      });
+    });
+  }
 }
 
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error('Error:', err.stack);
-  res.status(500).json({ error: 'Something went wrong!' });
+  console.error('Request URL:', req.url);
+  console.error('Request Method:', req.method);
+  
+  // Send appropriate response based on request type
+  if (req.xhr || req.headers.accept?.indexOf('json') > -1) {
+    res.status(500).json({ error: 'Something went wrong!' });
+  } else {
+    res.status(500).send(`
+      <!DOCTYPE html>
+      <html>
+      <head><title>Server Error</title></head>
+      <body>
+        <h1>500 - Server Error</h1>
+        <p>Something went wrong. Please try again later.</p>
+        <a href="/">Go to Home</a>
+      </body>
+      </html>
+    `);
+  }
 });
 
 // Handle 404 for API routes
@@ -433,11 +545,16 @@ app.use('/api/*', (req, res) => {
   res.status(404).json({ error: 'API endpoint not found' });
 });
 
-// Start server
-server.listen(PORT, '0.0.0.0', () => {
+// Start server - FIXED: Better error handling
+server.listen(PORT, '0.0.0.0', (err) => {
+  if (err) {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  }
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📊 Environment: ${NODE_ENV}`);
   console.log(`🗄️  Database: ${dbPath}`);
+  console.log(`🌐 Server accessible at: http://0.0.0.0:${PORT}`);
 });
 
 // Graceful shutdown
@@ -462,4 +579,15 @@ process.on('SIGTERM', () => {
       process.exit(0);
     });
   });
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  process.exit(1);
 });
